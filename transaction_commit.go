@@ -244,35 +244,52 @@ func (tx *Transaction) applyUpdateOperationToDatabase(adapter persist.Adapter, o
 	return nil
 }
 
-// applyOperationsToModel applies all buffered operations to the in-memory model.
+// applyOperationsToModel merges all buffered operations into the enforcer's
+// live in-memory model.
+//
+// The operations are applied on top of the current model instead of rebuilding
+// it from the transaction's base snapshot: other transactions, or the plain
+// management API, may have committed changes after this transaction started.
+// Replacing the model with a snapshot-derived model would silently discard
+// those already-committed changes even though the database keeps them (the
+// rules would only reappear after a reload). Commit's conflict detection
+// guarantees that buffered remove/update operations are still valid against
+// the current model, while add operations never conflict; duplicate adds and
+// removes of missing rules are therefore tolerated by the merge itself.
 func (tx *Transaction) applyOperationsToModel() error {
-	// Create new model with all operations applied.
-	newModel, err := tx.buffer.ApplyOperationsToModel(tx.buffer.GetModelSnapshot())
-	if err != nil {
-		return err
-	}
+	e := tx.enforcer
+	liveModel := e.model
 
-	// Replace the enforcer's model.
-	tx.enforcer.model = newModel
-	tx.enforcer.invalidateMatcherMap()
-
-	// Rebuild role links if necessary.
-	if tx.enforcer.autoBuildRoleLinks {
-		// Check if any operations involved grouping policies.
-		operations := tx.buffer.GetOperations()
-		needRoleRebuild := false
-
-		for _, op := range operations {
-			if op.Section == "g" {
-				needRoleRebuild = true
-				break
+	needRoleRebuild := false
+	for _, op := range tx.buffer.GetOperations() {
+		switch op.Type {
+		case persist.OperationAdd:
+			// AddPoliciesWithAffected skips rules that another change already added.
+			if _, err := liveModel.AddPoliciesWithAffected(op.Section, op.PolicyType, op.Rules); err != nil {
+				return err
+			}
+		case persist.OperationRemove:
+			// RemovePoliciesWithAffected tolerates rules that are no longer present.
+			if _, err := liveModel.RemovePoliciesWithAffected(op.Section, op.PolicyType, op.Rules); err != nil {
+				return err
+			}
+		case persist.OperationUpdate:
+			if _, err := liveModel.UpdatePolicies(op.Section, op.PolicyType, op.OldRules, op.Rules); err != nil {
+				return err
 			}
 		}
 
-		if needRoleRebuild {
-			if err := tx.enforcer.BuildRoleLinks(); err != nil {
-				return err
-			}
+		if op.Section == "g" {
+			needRoleRebuild = true
+		}
+	}
+
+	e.invalidateMatcherMap()
+
+	// Rebuild role links if any grouping policies were touched.
+	if e.autoBuildRoleLinks && needRoleRebuild {
+		if err := e.BuildRoleLinks(); err != nil {
+			return err
 		}
 	}
 
